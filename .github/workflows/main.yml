@@ -125,52 +125,26 @@ jobs:
         run: |
           Write-Host "Starting websockify proxy..."
           
-          # Create a startup script for websockify
-          $scriptContent = @"
-import sys
-import os
-
-# Add Python Scripts to PATH
-scripts_path = r'C:\Python311\Scripts'
-if scripts_path not in os.environ['PATH']:
-    os.environ['PATH'] = scripts_path + os.pathsep + os.environ['PATH']
-
-# Now run websockify
-from websockify import websockifyserver
-
-websockifyserver.websockify_init()
-"@
-          
-          $scriptPath = "$env:TEMP\start_websockify.py"
-          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
-          
-          # Start websockify as background process
           $websockifyCmd = "python -m websockify --web=. 0.0.0.0:6080 localhost:5900"
           
-          Start-Process powershell -ArgumentList "-NoExit", "-Command", $websockifyCmd -WindowStyle Hidden
+          Start-Process powershell -ArgumentList "-NoExit","-Command",$websockifyCmd -WindowStyle Hidden
           
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 8
           
-          # Verify websockify is running
-          $wsProcess = Get-Process python -ErrorAction SilentlyContinue | Where-Object {
-              $_.CommandLine -like "*websockify*"
-          }
-          
-          if ($wsProcess) {
-              Write-Host "✓ Websockify proxy started successfully on port 6080"
-          } else {
-              Write-Warning "⚠ Could not verify websockify process, but continuing..."
-          }
-          
-          # Test local connection
-          Start-Sleep -Seconds 2
           try {
               $test = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
               if ($test.TcpTestSucceeded) {
-                  Write-Host "✓ WebSocket proxy is accessible on port 6080"
+                  Write-Host "Websockify proxy started successfully on port 6080"
+              } else {
+                  Write-Warning "Could not verify websockify on port 6080"
               }
           } catch {
-              Write-Host "WebSocket test inconclusive, will verify via Tailscale"
+              Write-Host "WebSocket test inconclusive"
+          }
+          
+          $pythonProcs = Get-Process python -ErrorAction SilentlyContinue
+          if ($pythonProcs) {
+              Write-Host "Python processes detected"
           }
 
       - name: Download MuMu Player
