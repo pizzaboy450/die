@@ -1,60 +1,43 @@
-name: VNC with MuMu Player (Ngrok Stable)
-
-on:
-  workflow_dispatch:
-    inputs:
-      ngrok_token:
-        description: 'Enter your Ngrok Auth Token'
-        required: true
+name: VNC MuMu (Cloudflare Direct)
+on: workflow_dispatch
 
 jobs:
-  vnc-setup:
+  vnc:
     runs-on: windows-latest
-    timeout-minutes: 3600
-    
     steps:
-      - name: Create VNC User
+      - name: Install VNC & Cloudflared
         run: |
-          $password = "MumuPlayer123!"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "VNCUser" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "VNCUser"
-          echo "VNC_PASSWORD=$password" >> $env:GITHUB_ENV
+          choco install tightvnc cloudflared -y
+          pip install websockify
 
-      - name: Install Tools (VNC & Python)
+      - name: Start VNC Server
         run: |
-          choco install tightvnc -y
-          pip install websockify numpy
-
-      - name: Configure VNC Server
-        run: |
-          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
-          Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1 -Force
-          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -set AdminPasswordPlain="$env:VNC_PASSWORD"
+          $pass = "VNCpass123!"
+          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -set AdminPasswordPlain="$pass"
           Start-Service -Name "tvnserver"
 
-      - name: Start Websockify Proxy
+      - name: Start Web Bridge
         run: |
-          Start-Process powershell -ArgumentList "-NoExit","-Command","python -m websockify --web=. 0.0.0.0:6080 localhost:5900" -WindowStyle Hidden
-          Start-Sleep -Seconds 5
+          # Converts VNC to a browser-friendly format on port 6080
+          Start-Process powershell -ArgumentList "-Command","python -m websockify 6080 localhost:5900" -WindowStyle Hidden
 
-      - name: Setup & Start Ngrok
+      - name: Launch Cloudflare Tunnel
+        shell: pwsh
         run: |
-          choco install ngrok -y
-          ngrok config add-authtoken "${{ github.event.inputs.ngrok_token }}"
-          Start-Process ngrok -ArgumentList "http 6080" -WindowStyle Hidden
-          Start-Sleep -Seconds 10
-
-      - name: Get Ngrok URL
-        run: |
-          $json = Invoke-RestMethod -Uri http://localhost:4040/api/tunnels
-          $url = $json.tunnels[0].public_url
-          Write-Host "`n=========================================="
-          Write-Host "VNC URL: $url"
-          Write-Host "PASSWORD: $env:VNC_PASSWORD"
-          Write-Host "==========================================`n"
-
-      - name: Maintain Connection
-        run: |
-          Write-Host "🟢 SESSION ACTIVE ON NGROK!"
-          while ($true) { Start-Sleep -Seconds 300 }
+          Write-Host "Creating secure tunnel..."
+          # This starts a public tunnel to your local port 6080
+          Start-Process cloudflared -ArgumentList "tunnel --url http://127.0.0.1:6080" -RedirectStandardOutput "cloudflare.log"
+          
+          Write-Host "Waiting for URL..."
+          Start-Sleep -Seconds 15
+          
+          # This grabs the random .trycloudflare.com link from the log file
+          $url = Get-Content "cloudflare.log" | Select-String -Pattern "https://.*\.trycloudflare\.com" | ForEach-Object { $_.Matches.Value }
+          
+          Write-Host "=========================================="
+          Write-Host "ACCESS URL: $url"
+          Write-Host "VNC PASSWORD: VNCpass123!"
+          Write-Host "=========================================="
+          
+          # Keep the VM alive
+          while($true) { Start-Sleep 300 }
