@@ -1,4 +1,4 @@
-name: VNC with MuMu Player (Cloudflare)
+name: VNC with MuMu Player (LocalTunnel)
 
 on:
   workflow_dispatch:
@@ -39,8 +39,19 @@ jobs:
           [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
           iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
 
-      - name: Install Python and Dependencies
+      - name: Install Node.js
         run: |
+          Write-Host "Installing Node.js..."
+          choco install nodejs -y
+          refreshenv
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          
+          node --version
+          npm --version
+
+      - name: Install Python and Websockify
+        run: |
+          Write-Host "Installing Python..."
           choco install python -y --version=3.11.0
           refreshenv
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
@@ -115,60 +126,90 @@ jobs:
               Write-Host "Websockify running on port 6080"
           }
 
-      - name: Download Cloudflared
+      - name: Install LocalTunnel
         run: |
-          Write-Host "Downloading Cloudflare Tunnel (cloudflared)..."
-          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cloudflaredPath = "$env:TEMP\cloudflared.exe"
+          Write-Host "Installing LocalTunnel (localtunnel)..."
           
-          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          npm install -g localtunnel
           
-          if (Test-Path $cloudflaredPath) {
-              Write-Host "Cloudflared downloaded successfully"
-              echo "CLOUDFLARED_PATH=$cloudflaredPath" >> $env:GITHUB_ENV
+          # Verify installation
+          $ltPath = Get-Command lt -ErrorAction SilentlyContinue
+          if ($ltPath) {
+              Write-Host "LocalTunnel installed successfully"
           } else {
-              Write-Error "Failed to download cloudflared"
+              Write-Error "LocalTunnel installation failed"
               exit 1
           }
 
-      - name: Start Cloudflare Tunnel
+      - name: Start LocalTunnel
         run: |
-          Write-Host "Starting Cloudflare Tunnel (this creates a public URL)..."
+          Write-Host "Starting LocalTunnel on port 6080..."
           
-          $cloudflaredPath = $env:CLOUDFLARED_PATH
+          # Create a custom subdomain (optional, or let it auto-generate)
+          $subdomain = "vnc-$(Get-Random -Minimum 1000 -Maximum 9999)"
           
-          # Start cloudflared tunnel in background and capture output
-          $logFile = "$env:TEMP\cloudflared.log"
-          Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel","--url","http://localhost:6080" `
-            -RedirectStandardOutput $logFile -WindowStyle Hidden
+          # Start localtunnel in background and capture output
+          $logFile = "$env:TEMP\localtunnel.log"
+          
+          Start-Process powershell -ArgumentList "-NoExit","-Command","lt --port 6080 --subdomain $subdomain 2>&1 | Tee-Object -FilePath $logFile" -WindowStyle Hidden
           
           Write-Host "Waiting for tunnel to establish..."
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 10
           
-          # Read the log file to get the public URL
-          $maxRetries = 20
+          # Try to get URL from log file
+          $maxRetries = 30
           $retryCount = 0
           $tunnelUrl = $null
           
           while ($retryCount -lt $maxRetries) {
               if (Test-Path $logFile) {
-                  $logContent = Get-Content $logFile -Raw
+                  $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
                   
-                  # Look for the trycloudflare.com URL
-                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.trycloudflare\.com)') {
+                  # Look for the loca.lt URL pattern
+                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.loca\.lt)') {
+                      $tunnelUrl = $matches[1]
+                      break
+                  }
+                  
+                  # Alternative pattern
+                  if ($logContent -match 'your url is:\s+(https://[^\s]+)') {
                       $tunnelUrl = $matches[1]
                       break
                   }
               }
               
-              Start-Sleep -Seconds 3
+              Start-Sleep -Seconds 2
               $retryCount++
               Write-Host "Waiting for tunnel URL... (attempt $retryCount/$maxRetries)"
           }
           
+          # If log file method fails, try direct command
+          if (-not $tunnelUrl) {
+              Write-Host "Trying alternative method to get tunnel URL..."
+              
+              # Kill previous process and start fresh with direct output capture
+              Get-Process | Where-Object {$_.ProcessName -eq "node" -and $_.CommandLine -like "*localtunnel*"} | Stop-Process -Force -ErrorAction SilentlyContinue
+              
+              Start-Sleep -Seconds 3
+              
+              # Start again without subdomain (let it auto-generate)
+              $output = & lt --port 6080 2>&1
+              $tunnelUrl = ($output | Select-String -Pattern "https://.*\.loca\.lt").Matches.Value | Select-Object -First 1
+              
+              if ($tunnelUrl) {
+                  # Now start it properly in background
+                  Start-Process powershell -ArgumentList "-NoExit","-Command","lt --port 6080" -WindowStyle Hidden
+                  Start-Sleep -Seconds 5
+              }
+          }
+          
           if ($tunnelUrl) {
+              # Clean up URL
+              $tunnelUrl = $tunnelUrl.Trim()
+              
               # Convert https to wss for WebSocket
               $wsUrl = $tunnelUrl -replace "https://", "wss://"
+              $hostname = $tunnelUrl -replace "https://", "" -replace "http://", ""
               
               Write-Host "`n================================"
               Write-Host "TUNNEL ESTABLISHED!"
@@ -178,13 +219,17 @@ jobs:
               
               echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
               echo "TUNNEL_WS_URL=$wsUrl" >> $env:GITHUB_ENV
+              echo "TUNNEL_HOST=$hostname" >> $env:GITHUB_ENV
           } else {
-              Write-Error "Could not get tunnel URL from cloudflared"
-              Write-Host "Log content:"
-              if (Test-Path $logFile) {
-                  Get-Content $logFile
-              }
-              exit 1
+              Write-Warning "Could not automatically detect tunnel URL"
+              Write-Host "But LocalTunnel should be running. Check logs manually."
+              Write-Host "`nManual check: The URL should be visible in the process output"
+              Write-Host "It will be in format: https://something.loca.lt"
+              
+              # Set placeholder
+              echo "TUNNEL_URL=Check_GitHub_Logs" >> $env:GITHUB_ENV
+              echo "TUNNEL_WS_URL=Check_GitHub_Logs" >> $env:GITHUB_ENV
+              echo "TUNNEL_HOST=Check_Logs" >> $env:GITHUB_ENV
           }
 
       - name: Download MuMu Player
@@ -269,41 +314,49 @@ jobs:
                        elseif ($env:MUMU_INSTALLED -eq "false") { "Install Manually" }
                        else { "Check After Connect" }
           
-          $hostname = $env:TUNNEL_URL -replace 'https://','' -replace 'http://',''
-          
           Write-Host "`n╔════════════════════════════════════════════════════════════╗"
-          Write-Host "║    VNC WEB ACCESS - NO ACCOUNT/TOKEN REQUIRED! 🎉         ║"
+          Write-Host "║    VNC WEB ACCESS - NO REGISTRATION REQUIRED! 🚀          ║"
           Write-Host "╠════════════════════════════════════════════════════════════╣"
           Write-Host "║                                                            ║"
-          Write-Host "║  🌐 OPEN YOUR HTML PAGE AND ENTER:                        ║"
+          Write-Host "║  🌐 CONNECTION DETAILS:                                   ║"
           Write-Host "║                                                            ║"
-          Write-Host "║  Host: $hostname"
-          Write-Host "║  Port: 443                                                 ║"
-          Write-Host "║  Password: $env:VNC_PASSWORD"
-          Write-Host "║                                                            ║"
-          Write-Host "║  OR use full WebSocket URL:                               ║"
-          Write-Host "║  $env:TUNNEL_WS_URL"
+          
+          if ($env:TUNNEL_HOST -ne "Check_Logs") {
+              Write-Host "║  Host: $env:TUNNEL_HOST"
+              Write-Host "║  Port: 443                                                 ║"
+              Write-Host "║  Password: $env:VNC_PASSWORD"
+              Write-Host "║                                                            ║"
+              Write-Host "║  Full WebSocket URL:                                      ║"
+              Write-Host "║  $env:TUNNEL_WS_URL"
+          } else {
+              Write-Host "║  ⚠️  URL DETECTION FAILED                                 ║"
+              Write-Host "║  Check the 'Start LocalTunnel' step logs above           ║"
+              Write-Host "║  Look for: https://xxxxx.loca.lt                          ║"
+              Write-Host "║                                                            ║"
+              Write-Host "║  Password: $env:VNC_PASSWORD"
+          }
+          
           Write-Host "║                                                            ║"
           Write-Host "║  📱 MuMu Player: $mumuStatus"
           Write-Host "║                                                            ║"
           Write-Host "║  ✨ FEATURES:                                              ║"
-          Write-Host "║  • No Cloudflare account needed                           ║"
+          Write-Host "║  • No account/registration needed                         ║"
           Write-Host "║  • No time limits                                         ║"
-          Write-Host "║  • Works from anywhere in the world                       ║"
-          Write-Host "║  • Encrypted HTTPS/WSS connection                         ║"
+          Write-Host "║  • Free forever                                           ║"
+          Write-Host "║  • HTTPS/WSS encrypted                                    ║"
           Write-Host "║                                                            ║"
           Write-Host "╚════════════════════════════════════════════════════════════╝`n"
           
           Write-Host "📋 QUICK START:"
-          Write-Host "1. Open the HTML VNC client page"
-          Write-Host "2. Enter the host above (without https://)"
+          Write-Host "1. Open your HTML VNC client page"
+          Write-Host "2. Enter the host/URL shown above"
           Write-Host "3. Port: 443"
           Write-Host "4. Enter the password"
           Write-Host "5. Click Connect!`n"
           
-          Write-Host "⚠️  NOTE: URL changes each workflow run"
-          Write-Host "🔗 Direct browser access: $env:TUNNEL_URL"
-          Write-Host "    (But use WebSocket URL in VNC client)`n"
+          if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
+              Write-Host "🔗 Direct URL: $env:TUNNEL_URL`n"
+          }
           
           if ($env:MUMU_INSTALLED -eq "false") {
               Write-Host "📥 MuMu Player Manual Install:"
@@ -312,28 +365,29 @@ jobs:
 
       - name: Maintain Connection
         run: |
-          Write-Host "🟢 SESSION ACTIVE - Accessible Worldwide!"
-          Write-Host "🔗 URL: $env:TUNNEL_URL"
-          Write-Host "⏱️  No time limits! (until you cancel)`n"
+          Write-Host "🟢 SESSION ACTIVE!"
+          if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
+              Write-Host "🔗 URL: $env:TUNNEL_URL"
+          }
+          Write-Host "⏱️  No limits - runs until you cancel!`n"
           
           $counter = 0
           while ($true) {
               $counter++
               $runtime = [math]::Round($counter * 5 / 60, 1)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✓ Active | Runtime: $runtime min | URL: $env:TUNNEL_URL"
+              
+              $status = "Active"
+              if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
+                  $status = "Active | URL: $env:TUNNEL_URL"
+              }
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✓ $status | Runtime: $runtime min"
               
               if ($counter % 12 -eq 0) {
                   $vncService = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
                   if ($vncService.Status -ne "Running") {
                       Write-Warning "VNC service stopped, restarting..."
                       Start-Service -Name "tvnserver"
-                  }
-                  
-                  $cloudflaredProc = Get-Process cloudflared -ErrorAction SilentlyContinue
-                  if (-not $cloudflaredProc) {
-                      Write-Warning "Cloudflare tunnel stopped, restarting..."
-                      $cloudflaredPath = $env:CLOUDFLARED_PATH
-                      Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel","--url","http://localhost:6080" -WindowStyle Hidden
                   }
               }
               
