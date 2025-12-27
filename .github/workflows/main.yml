@@ -9,6 +9,15 @@ jobs:
     timeout-minutes: 3600
     
     steps:
+      - name: Get Bypass IP
+        id: bypass
+        run: |
+          $ip = Invoke-RestMethod -Uri "https://api.ipify.org"
+          echo "RUNNER_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "=========================================="
+          Write-Host "BYPASS IP: $ip"
+          Write-Host "=========================================="
+
       - name: Create VNC User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
@@ -28,368 +37,58 @@ jobs:
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "VNCUser" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "VNCUser"
-          
           echo "VNC_PASSWORD=$password" >> $env:GITHUB_ENV
-          
           Write-Host "VNC User created successfully"
 
-      - name: Install Chocolatey
+      - name: Install Chocolatey & Dependencies
         run: |
           Set-ExecutionPolicy Bypass -Scope Process -Force
           [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-
-      - name: Install Node.js
-        run: |
-          Write-Host "Installing Node.js..."
-          choco install nodejs -y
-          refreshenv
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
-          node --version
-          npm --version
-
-      - name: Install Python and Websockify
-        run: |
-          Write-Host "Installing Python..."
-          choco install python -y --version=3.11.0
-          refreshenv
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          
-          Write-Host "Installing websockify..."
-          python -m pip install --upgrade pip
-          python -m pip install websockify numpy
-          
-          python --version
-
-      - name: Install TightVNC Server
-        run: |
-          $vncUrl = "https://www.tightvnc.com/download/2.8.84/tightvnc-2.8.84-gpl-setup-64bit.msi"
-          $installerPath = "$env:TEMP\tightvnc.msi"
-          
-          Write-Host "Downloading TightVNC..."
-          Invoke-WebRequest -Uri $vncUrl -OutFile $installerPath
-          
-          Write-Host "Installing TightVNC..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", `
-            "/quiet", "/norestart", `
-            "ADDLOCAL=Server", `
-            "SERVER_REGISTER_AS_SERVICE=1", `
-            "SERVER_ADD_FIREWALL_EXCEPTION=1", `
-            "SET_USEVNCAUTHENTICATION=1", `
-            "VALUE_OF_USEVNCAUTHENTICATION=1" -Wait
-          
-          Remove-Item $installerPath -Force
-          Start-Sleep -Seconds 5
+          choco install nodejs python tightvnc -y
+          pip install websockify numpy
+          npm install -g localtunnel
 
       - name: Configure VNC Server
         run: |
           $vncPasswd = $env:VNC_PASSWORD
-          
           Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
-          
           $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
           Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1 -Force
           Set-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -Force
-          Set-ItemProperty -Path $regPath -Name "LoopbackOnly" -Value 0 -Force
-          Set-ItemProperty -Path $regPath -Name "AcceptRfbConnections" -Value 1 -Force
-          
-          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -shareall
-          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -shareprimary
-          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -set AdminPasswordPlain="$vncPasswd"
-          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -set ControlPassword="$vncPasswd"
-          
+          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -set AdminPasswordPlain="$vncPasswd"
           Start-Service -Name "tvnserver"
-          Start-Sleep -Seconds 3
-          
-          $service = Get-Service -Name "tvnserver"
-          if ($service.Status -ne "Running") {
-              Write-Error "VNC Server failed to start"
-              exit 1
-          }
-          
           Write-Host "VNC Server running on port 5900"
 
       - name: Start Websockify Proxy
         run: |
-          Write-Host "Starting websockify proxy on port 6080..."
-          
-          $websockifyCmd = "python -m websockify --web=. 0.0.0.0:6080 localhost:5900"
-          
-          Start-Process powershell -ArgumentList "-NoExit","-Command",$websockifyCmd -WindowStyle Hidden
-          
-          Start-Sleep -Seconds 8
-          
-          $test = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
-          if ($test.TcpTestSucceeded) {
-              Write-Host "Websockify running on port 6080"
-          }
-
-      - name: Install LocalTunnel
-        run: |
-          Write-Host "Installing LocalTunnel (localtunnel)..."
-          
-          npm install -g localtunnel
-          
-          # Verify installation
-          $ltPath = Get-Command lt -ErrorAction SilentlyContinue
-          if ($ltPath) {
-              Write-Host "LocalTunnel installed successfully"
-          } else {
-              Write-Error "LocalTunnel installation failed"
-              exit 1
-          }
+          Write-Host "Starting websockify proxy..."
+          Start-Process powershell -ArgumentList "-NoExit","-Command","python -m websockify --web=. 0.0.0.0:6080 localhost:5900" -WindowStyle Hidden
+          Start-Sleep -Seconds 5
 
       - name: Start LocalTunnel
         run: |
-          Write-Host "Starting LocalTunnel on port 6080..."
-          
-          # Create a custom subdomain (optional, or let it auto-generate)
           $subdomain = "vnc-$(Get-Random -Minimum 1000 -Maximum 9999)"
-          
-          # Start localtunnel in background and capture output
           $logFile = "$env:TEMP\localtunnel.log"
-          
           Start-Process powershell -ArgumentList "-NoExit","-Command","lt --port 6080 --subdomain $subdomain 2>&1 | Tee-Object -FilePath $logFile" -WindowStyle Hidden
-          
-          Write-Host "Waiting for tunnel to establish..."
+          Write-Host "Waiting for tunnel..."
           Start-Sleep -Seconds 10
-          
-          # Try to get URL from log file
-          $maxRetries = 30
-          $retryCount = 0
-          $tunnelUrl = $null
-          
-          while ($retryCount -lt $maxRetries) {
-              if (Test-Path $logFile) {
-                  $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
-                  
-                  # Look for the loca.lt URL pattern
-                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.loca\.lt)') {
-                      $tunnelUrl = $matches[1]
-                      break
-                  }
-                  
-                  # Alternative pattern
-                  if ($logContent -match 'your url is:\s+(https://[^\s]+)') {
-                      $tunnelUrl = $matches[1]
-                      break
-                  }
-              }
-              
-              Start-Sleep -Seconds 2
-              $retryCount++
-              Write-Host "Waiting for tunnel URL... (attempt $retryCount/$maxRetries)"
+          $logContent = Get-Content $logFile -Raw
+          if ($logContent -match '(https://[a-zA-Z0-9-]+\.loca\.lt)') {
+              $url = $matches[1]
+              echo "TUNNEL_URL=$url" >> $env:GITHUB_ENV
+              echo "TUNNEL_HOST=($url -replace 'https://', '')" >> $env:GITHUB_ENV
           }
-          
-          # If log file method fails, try direct command
-          if (-not $tunnelUrl) {
-              Write-Host "Trying alternative method to get tunnel URL..."
-              
-              # Kill previous process and start fresh with direct output capture
-              Get-Process | Where-Object {$_.ProcessName -eq "node" -and $_.CommandLine -like "*localtunnel*"} | Stop-Process -Force -ErrorAction SilentlyContinue
-              
-              Start-Sleep -Seconds 3
-              
-              # Start again without subdomain (let it auto-generate)
-              $output = & lt --port 6080 2>&1
-              $tunnelUrl = ($output | Select-String -Pattern "https://.*\.loca\.lt").Matches.Value | Select-Object -First 1
-              
-              if ($tunnelUrl) {
-                  # Now start it properly in background
-                  Start-Process powershell -ArgumentList "-NoExit","-Command","lt --port 6080" -WindowStyle Hidden
-                  Start-Sleep -Seconds 5
-              }
-          }
-          
-          if ($tunnelUrl) {
-              # Clean up URL
-              $tunnelUrl = $tunnelUrl.Trim()
-              
-              # Convert https to wss for WebSocket
-              $wsUrl = $tunnelUrl -replace "https://", "wss://"
-              $hostname = $tunnelUrl -replace "https://", "" -replace "http://", ""
-              
-              Write-Host "`n================================"
-              Write-Host "TUNNEL ESTABLISHED!"
-              Write-Host "Public URL: $tunnelUrl"
-              Write-Host "WebSocket URL: $wsUrl"
-              Write-Host "================================`n"
-              
-              echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
-              echo "TUNNEL_WS_URL=$wsUrl" >> $env:GITHUB_ENV
-              echo "TUNNEL_HOST=$hostname" >> $env:GITHUB_ENV
-          } else {
-              Write-Warning "Could not automatically detect tunnel URL"
-              Write-Host "But LocalTunnel should be running. Check logs manually."
-              Write-Host "`nManual check: The URL should be visible in the process output"
-              Write-Host "It will be in format: https://something.loca.lt"
-              
-              # Set placeholder
-              echo "TUNNEL_URL=Check_GitHub_Logs" >> $env:GITHUB_ENV
-              echo "TUNNEL_WS_URL=Check_GitHub_Logs" >> $env:GITHUB_ENV
-              echo "TUNNEL_HOST=Check_Logs" >> $env:GITHUB_ENV
-          }
-
-      - name: Download MuMu Player
-        run: |
-          $installerPath = "$env:TEMP\MuMuInstaller.exe"
-          
-          Write-Host "Downloading MuMu Player..."
-          
-          $sources = @(
-              "https://mumu.cae5df2a.c3p0.dianlianyule.com/MuMuPlayer-12.0.exe",
-              "https://dl-sh-mumu-static.mumu.163.com/installer/MuMuPlayer-12.0.exe"
-          )
-          
-          $downloaded = $false
-          foreach ($url in $sources) {
-              try {
-                  Write-Host "Trying: $url"
-                  Invoke-WebRequest -Uri $url -OutFile $installerPath -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -TimeoutSec 60
-                  if ((Test-Path $installerPath) -and ((Get-Item $installerPath).Length -gt 1MB)) {
-                      $fileSize = (Get-Item $installerPath).Length / 1MB
-                      Write-Host "Downloaded MuMu Player: $([math]::Round($fileSize, 2)) MB"
-                      $downloaded = $true
-                      break
-                  }
-              } catch {
-                  Write-Host "Failed: $_"
-                  if (Test-Path $installerPath) { Remove-Item $installerPath -Force }
-              }
-          }
-          
-          if ($downloaded -and (Test-Path $installerPath)) {
-              echo "MUMU_INSTALLER=$installerPath" >> $env:GITHUB_ENV
-          } else {
-              Write-Warning "Failed to download MuMu Player"
-              echo "MUMU_INSTALLER=" >> $env:GITHUB_ENV
-          }
-
-      - name: Install MuMu Player
-        run: |
-          $installerPath = $env:MUMU_INSTALLER
-          
-          if (-not $installerPath -or -not (Test-Path $installerPath)) {
-              Write-Host "MuMu Player not downloaded - install manually via VNC"
-              echo "MUMU_INSTALLED=false" >> $env:GITHUB_ENV
-              return
-          }
-          
-          Write-Host "Installing MuMu Player..."
-          
-          $process = Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-          
-          Write-Host "Installation exited with code: $($process.ExitCode)"
-          Start-Sleep -Seconds 15
-          
-          $possiblePaths = @(
-              "C:\Program Files\MuMuPlayer-12.0",
-              "C:\Program Files (x86)\MuMuPlayer-12.0",
-              "$env:LOCALAPPDATA\MuMuPlayer-12.0",
-              "$env:ProgramFiles\Netease\MuMuPlayer-12.0"
-          )
-          
-          $installed = $false
-          foreach ($path in $possiblePaths) {
-              if (Test-Path $path) {
-                  Write-Host "MuMu Player found at: $path"
-                  $installed = $true
-                  break
-              }
-          }
-          
-          if ($installed) {
-              echo "MUMU_INSTALLED=true" >> $env:GITHUB_ENV
-          } else {
-              echo "MUMU_INSTALLED=unknown" >> $env:GITHUB_ENV
-          }
-          
-          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
       - name: Display Connection Information
         run: |
-          $mumuStatus = if ($env:MUMU_INSTALLED -eq "true") { "Installed" } 
-                       elseif ($env:MUMU_INSTALLED -eq "false") { "Install Manually" }
-                       else { "Check After Connect" }
-          
           Write-Host "`n╔════════════════════════════════════════════════════════════╗"
-          Write-Host "║    VNC WEB ACCESS - NO REGISTRATION REQUIRED! 🚀          ║"
-          Write-Host "╠════════════════════════════════════════════════════════════╣"
-          Write-Host "║                                                            ║"
-          Write-Host "║  🌐 CONNECTION DETAILS:                                   ║"
-          Write-Host "║                                                            ║"
-          
-          if ($env:TUNNEL_HOST -ne "Check_Logs") {
-              Write-Host "║  Host: $env:TUNNEL_HOST"
-              Write-Host "║  Port: 443                                                 ║"
-              Write-Host "║  Password: $env:VNC_PASSWORD"
-              Write-Host "║                                                            ║"
-              Write-Host "║  Full WebSocket URL:                                      ║"
-              Write-Host "║  $env:TUNNEL_WS_URL"
-          } else {
-              Write-Host "║  ⚠️  URL DETECTION FAILED                                 ║"
-              Write-Host "║  Check the 'Start LocalTunnel' step logs above           ║"
-              Write-Host "║  Look for: https://xxxxx.loca.lt                          ║"
-              Write-Host "║                                                            ║"
-              Write-Host "║  Password: $env:VNC_PASSWORD"
-          }
-          
-          Write-Host "║                                                            ║"
-          Write-Host "║  📱 MuMu Player: $mumuStatus"
-          Write-Host "║                                                            ║"
-          Write-Host "║  ✨ FEATURES:                                              ║"
-          Write-Host "║  • No account/registration needed                         ║"
-          Write-Host "║  • No time limits                                         ║"
-          Write-Host "║  • Free forever                                           ║"
-          Write-Host "║  • HTTPS/WSS encrypted                                    ║"
-          Write-Host "║                                                            ║"
+          Write-Host "║ 🌐 BYPASS DETAILS:                                        ║"
+          Write-Host "║ 1. Open URL: $env:TUNNEL_URL                              ║"
+          Write-Host "║ 2. Use this IP to Bypass: $env:RUNNER_IP                  ║"
+          Write-Host "║ 3. VNC Password: $env:VNC_PASSWORD                        ║"
           Write-Host "╚════════════════════════════════════════════════════════════╝`n"
-          
-          Write-Host "📋 QUICK START:"
-          Write-Host "1. Open your HTML VNC client page"
-          Write-Host "2. Enter the host/URL shown above"
-          Write-Host "3. Port: 443"
-          Write-Host "4. Enter the password"
-          Write-Host "5. Click Connect!`n"
-          
-          if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
-              Write-Host "🔗 Direct URL: $env:TUNNEL_URL`n"
-          }
-          
-          if ($env:MUMU_INSTALLED -eq "false") {
-              Write-Host "📥 MuMu Player Manual Install:"
-              Write-Host "   After connecting, visit: https://mumu.163.com/`n"
-          }
 
       - name: Maintain Connection
         run: |
-          Write-Host "🟢 SESSION ACTIVE!"
-          if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
-              Write-Host "🔗 URL: $env:TUNNEL_URL"
-          }
-          Write-Host "⏱️  No limits - runs until you cancel!`n"
-          
-          $counter = 0
-          while ($true) {
-              $counter++
-              $runtime = [math]::Round($counter * 5 / 60, 1)
-              
-              $status = "Active"
-              if ($env:TUNNEL_URL -ne "Check_GitHub_Logs") {
-                  $status = "Active | URL: $env:TUNNEL_URL"
-              }
-              
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✓ $status | Runtime: $runtime min"
-              
-              if ($counter % 12 -eq 0) {
-                  $vncService = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
-                  if ($vncService.Status -ne "Running") {
-                      Write-Warning "VNC service stopped, restarting..."
-                      Start-Service -Name "tvnserver"
-                  }
-              }
-              
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "🟢 SESSION ACTIVE! Port 6080 is Tunneled."
+          while ($true) { Start-Sleep -Seconds 300 }
