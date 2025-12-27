@@ -1,4 +1,4 @@
-name: VNC with MuMu Player (ngrok)
+name: VNC with MuMu Player (Cloudflare)
 
 on:
   workflow_dispatch:
@@ -31,10 +31,7 @@ jobs:
           
           echo "VNC_PASSWORD=$password" >> $env:GITHUB_ENV
           
-          if (-not (Get-LocalUser -Name "VNCUser")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          Write-Host "VNC User created successfully"
 
       - name: Install Chocolatey
         run: |
@@ -48,12 +45,11 @@ jobs:
           refreshenv
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
           
-          Write-Host "Installing websockify and numpy..."
+          Write-Host "Installing websockify..."
           python -m pip install --upgrade pip
           python -m pip install websockify numpy
           
           python --version
-          python -m pip show websockify
 
       - name: Install TightVNC Server
         run: |
@@ -114,61 +110,80 @@ jobs:
           
           Start-Sleep -Seconds 8
           
-          try {
-              $test = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
-              if ($test.TcpTestSucceeded) {
-                  Write-Host "Websockify proxy started on port 6080"
-              }
-          } catch {
-              Write-Warning "Could not verify websockify"
+          $test = Test-NetConnection -ComputerName localhost -Port 6080 -WarningAction SilentlyContinue
+          if ($test.TcpTestSucceeded) {
+              Write-Host "Websockify running on port 6080"
           }
 
-      - name: Install ngrok
+      - name: Download Cloudflared
         run: |
-          Write-Host "Installing ngrok..."
-          choco install ngrok -y
-          refreshenv
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          Write-Host "Downloading Cloudflare Tunnel (cloudflared)..."
+          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cloudflaredPath = "$env:TEMP\cloudflared.exe"
           
-          # Verify ngrok installation
-          & "C:\ProgramData\chocolatey\bin\ngrok.exe" version
+          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile $cloudflaredPath
+          
+          if (Test-Path $cloudflaredPath) {
+              Write-Host "Cloudflared downloaded successfully"
+              echo "CLOUDFLARED_PATH=$cloudflaredPath" >> $env:GITHUB_ENV
+          } else {
+              Write-Error "Failed to download cloudflared"
+              exit 1
+          }
 
-      - name: Configure ngrok with Auth Token
+      - name: Start Cloudflare Tunnel
         run: |
-          Write-Host "Configuring ngrok..."
-          & "C:\ProgramData\chocolatey\bin\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-
-      - name: Start ngrok Tunnel
-        run: |
-          Write-Host "Starting ngrok tunnel for WebSocket port 6080..."
+          Write-Host "Starting Cloudflare Tunnel (this creates a public URL)..."
           
-          # Start ngrok in background
-          Start-Process -FilePath "C:\ProgramData\chocolatey\bin\ngrok.exe" -ArgumentList "http","6080" -WindowStyle Hidden
+          $cloudflaredPath = $env:CLOUDFLARED_PATH
           
-          Start-Sleep -Seconds 10
+          # Start cloudflared tunnel in background and capture output
+          $logFile = "$env:TEMP\cloudflared.log"
+          Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel","--url","http://localhost:6080" `
+            -RedirectStandardOutput $logFile -WindowStyle Hidden
           
-          # Get ngrok public URL from API
-          try {
-              $ngrokApi = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels"
-              $publicUrl = $ngrokApi.tunnels[0].public_url
-              
-              if ($publicUrl) {
-                  # Convert https to wss for WebSocket
-                  $wsUrl = $publicUrl -replace "https://", "wss://"
-                  $wsUrl = $wsUrl -replace "http://", "ws://"
+          Write-Host "Waiting for tunnel to establish..."
+          Start-Sleep -Seconds 15
+          
+          # Read the log file to get the public URL
+          $maxRetries = 20
+          $retryCount = 0
+          $tunnelUrl = $null
+          
+          while ($retryCount -lt $maxRetries) {
+              if (Test-Path $logFile) {
+                  $logContent = Get-Content $logFile -Raw
                   
-                  Write-Host "ngrok tunnel established!"
-                  Write-Host "Public URL: $publicUrl"
-                  Write-Host "WebSocket URL: $wsUrl"
-                  
-                  echo "NGROK_URL=$publicUrl" >> $env:GITHUB_ENV
-                  echo "NGROK_WS_URL=$wsUrl" >> $env:GITHUB_ENV
-              } else {
-                  Write-Error "Could not get ngrok URL"
-                  exit 1
+                  # Look for the trycloudflare.com URL
+                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.trycloudflare\.com)') {
+                      $tunnelUrl = $matches[1]
+                      break
+                  }
               }
-          } catch {
-              Write-Error "Failed to connect to ngrok API: $_"
+              
+              Start-Sleep -Seconds 3
+              $retryCount++
+              Write-Host "Waiting for tunnel URL... (attempt $retryCount/$maxRetries)"
+          }
+          
+          if ($tunnelUrl) {
+              # Convert https to wss for WebSocket
+              $wsUrl = $tunnelUrl -replace "https://", "wss://"
+              
+              Write-Host "`n================================"
+              Write-Host "TUNNEL ESTABLISHED!"
+              Write-Host "Public URL: $tunnelUrl"
+              Write-Host "WebSocket URL: $wsUrl"
+              Write-Host "================================`n"
+              
+              echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+              echo "TUNNEL_WS_URL=$wsUrl" >> $env:GITHUB_ENV
+          } else {
+              Write-Error "Could not get tunnel URL from cloudflared"
+              Write-Host "Log content:"
+              if (Test-Path $logFile) {
+                  Get-Content $logFile
+              }
               exit 1
           }
 
@@ -254,49 +269,58 @@ jobs:
                        elseif ($env:MUMU_INSTALLED -eq "false") { "Install Manually" }
                        else { "Check After Connect" }
           
-          Write-Host "`n╔════════════════════════════════════════════════════════╗"
-          Write-Host "║       VNC WEB ACCESS - NO TAILSCALE REQUIRED!          ║"
-          Write-Host "╠════════════════════════════════════════════════════════╣"
-          Write-Host "║                                                        ║"
-          Write-Host "║  OPEN YOUR HTML PAGE AND ENTER:                       ║"
-          Write-Host "║                                                        ║"
-          Write-Host "║  Connection URL (copy this):                          ║"
-          Write-Host "║  $env:NGROK_WS_URL                                    "
-          Write-Host "║                                                        ║"
-          Write-Host "║  OR enter manually:                                   ║"
-          Write-Host "║  Host: $($env:NGROK_URL -replace 'https://','' -replace 'http://','')   "
-          Write-Host "║  Port: 443 (or 80)                                    ║"
-          Write-Host "║  Password: $env:VNC_PASSWORD                          "
-          Write-Host "║                                                        ║"
-          Write-Host "║  MuMu Player: $mumuStatus                             "
-          Write-Host "║                                                        ║"
-          Write-Host "║  Web Dashboard: http://localhost:4040                 ║"
-          Write-Host "║  (ngrok inspector - not accessible externally)        ║"
-          Write-Host "╚════════════════════════════════════════════════════════╝`n"
+          $hostname = $env:TUNNEL_URL -replace 'https://','' -replace 'http://',''
           
-          Write-Host "IMPORTANT NOTES:"
-          Write-Host "- No Tailscale needed! Works from any device"
-          Write-Host "- ngrok free tier has 2 hour session limit"
-          Write-Host "- URL changes each time you run workflow"
-          Write-Host "- Connection is encrypted via ngrok tunnel`n"
+          Write-Host "`n╔════════════════════════════════════════════════════════════╗"
+          Write-Host "║    VNC WEB ACCESS - NO ACCOUNT/TOKEN REQUIRED! 🎉         ║"
+          Write-Host "╠════════════════════════════════════════════════════════════╣"
+          Write-Host "║                                                            ║"
+          Write-Host "║  🌐 OPEN YOUR HTML PAGE AND ENTER:                        ║"
+          Write-Host "║                                                            ║"
+          Write-Host "║  Host: $hostname"
+          Write-Host "║  Port: 443                                                 ║"
+          Write-Host "║  Password: $env:VNC_PASSWORD"
+          Write-Host "║                                                            ║"
+          Write-Host "║  OR use full WebSocket URL:                               ║"
+          Write-Host "║  $env:TUNNEL_WS_URL"
+          Write-Host "║                                                            ║"
+          Write-Host "║  📱 MuMu Player: $mumuStatus"
+          Write-Host "║                                                            ║"
+          Write-Host "║  ✨ FEATURES:                                              ║"
+          Write-Host "║  • No Cloudflare account needed                           ║"
+          Write-Host "║  • No time limits                                         ║"
+          Write-Host "║  • Works from anywhere in the world                       ║"
+          Write-Host "║  • Encrypted HTTPS/WSS connection                         ║"
+          Write-Host "║                                                            ║"
+          Write-Host "╚════════════════════════════════════════════════════════════╝`n"
+          
+          Write-Host "📋 QUICK START:"
+          Write-Host "1. Open the HTML VNC client page"
+          Write-Host "2. Enter the host above (without https://)"
+          Write-Host "3. Port: 443"
+          Write-Host "4. Enter the password"
+          Write-Host "5. Click Connect!`n"
+          
+          Write-Host "⚠️  NOTE: URL changes each workflow run"
+          Write-Host "🔗 Direct browser access: $env:TUNNEL_URL"
+          Write-Host "    (But use WebSocket URL in VNC client)`n"
           
           if ($env:MUMU_INSTALLED -eq "false") {
-              Write-Host "MuMu Player Installation:"
-              Write-Host "- Connect via VNC first"
-              Write-Host "- Download from: https://mumu.163.com/`n"
+              Write-Host "📥 MuMu Player Manual Install:"
+              Write-Host "   After connecting, visit: https://mumu.163.com/`n"
           }
 
       - name: Maintain Connection
         run: |
-          Write-Host "Session active and accessible worldwide!"
-          Write-Host "ngrok URL: $env:NGROK_URL"
-          Write-Host "Use 'Cancel workflow' to terminate.`n"
+          Write-Host "🟢 SESSION ACTIVE - Accessible Worldwide!"
+          Write-Host "🔗 URL: $env:TUNNEL_URL"
+          Write-Host "⏱️  No time limits! (until you cancel)`n"
           
           $counter = 0
           while ($true) {
               $counter++
               $runtime = [math]::Round($counter * 5 / 60, 1)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active | Runtime: $runtime min | URL: $env:NGROK_URL"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✓ Active | Runtime: $runtime min | URL: $env:TUNNEL_URL"
               
               if ($counter % 12 -eq 0) {
                   $vncService = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
@@ -305,10 +329,11 @@ jobs:
                       Start-Service -Name "tvnserver"
                   }
                   
-                  $ngrokProc = Get-Process ngrok -ErrorAction SilentlyContinue
-                  if (-not $ngrokProc) {
-                      Write-Warning "ngrok stopped, restarting..."
-                      Start-Process -FilePath "C:\ProgramData\chocolatey\bin\ngrok.exe" -ArgumentList "http","6080" -WindowStyle Hidden
+                  $cloudflaredProc = Get-Process cloudflared -ErrorAction SilentlyContinue
+                  if (-not $cloudflaredProc) {
+                      Write-Warning "Cloudflare tunnel stopped, restarting..."
+                      $cloudflaredPath = $env:CLOUDFLARED_PATH
+                      Start-Process -FilePath $cloudflaredPath -ArgumentList "tunnel","--url","http://localhost:6080" -WindowStyle Hidden
                   }
               }
               
