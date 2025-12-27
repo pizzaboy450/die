@@ -15,35 +15,19 @@ jobs:
           $ip = Invoke-RestMethod -Uri "https://api.ipify.org"
           echo "RUNNER_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "=========================================="
-          Write-Host "BYPASS IP: $ip"
+          Write-Host "BYPASS IP (Use this on the website): $ip"
           Write-Host "=========================================="
 
-      - name: Create VNC User with Secure Password
+      - name: Create VNC User
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $password = "MumuPlayer123!"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "VNCUser" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "VNCUser"
           echo "VNC_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "VNC User created successfully"
 
-      - name: Install Chocolatey & Dependencies
+      - name: Install Tools
         run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
           choco install nodejs python tightvnc -y
           pip install websockify numpy
           npm install -g localtunnel
@@ -51,44 +35,55 @@ jobs:
       - name: Configure VNC Server
         run: |
           $vncPasswd = $env:VNC_PASSWORD
-          Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
           $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
           Set-ItemProperty -Path $regPath -Name "UseVncAuthentication" -Value 1 -Force
-          Set-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -Force
           & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -set AdminPasswordPlain="$vncPasswd"
           Start-Service -Name "tvnserver"
-          Write-Host "VNC Server running on port 5900"
 
       - name: Start Websockify Proxy
         run: |
-          Write-Host "Starting websockify proxy..."
           Start-Process powershell -ArgumentList "-NoExit","-Command","python -m websockify --web=. 0.0.0.0:6080 localhost:5900" -WindowStyle Hidden
           Start-Sleep -Seconds 5
 
-      - name: Start LocalTunnel
+      - name: Start LocalTunnel (With 503 Retry Fix)
+        id: tunnel
         run: |
-          $subdomain = "vnc-$(Get-Random -Minimum 1000 -Maximum 9999)"
-          $logFile = "$env:TEMP\localtunnel.log"
-          Start-Process powershell -ArgumentList "-NoExit","-Command","lt --port 6080 --subdomain $subdomain 2>&1 | Tee-Object -FilePath $logFile" -WindowStyle Hidden
-          Write-Host "Waiting for tunnel..."
-          Start-Sleep -Seconds 10
-          $logContent = Get-Content $logFile -Raw
-          if ($logContent -match '(https://[a-zA-Z0-9-]+\.loca\.lt)') {
-              $url = $matches[1]
-              echo "TUNNEL_URL=$url" >> $env:GITHUB_ENV
-              echo "TUNNEL_HOST=($url -replace 'https://', '')" >> $env:GITHUB_ENV
+          $maxAttempts = 5
+          $attempt = 0
+          $tunnelUrl = ""
+
+          while ($attempt -lt $maxAttempts -and -not $tunnelUrl) {
+              $attempt++
+              Write-Host "Starting Tunnel Attempt $attempt..."
+              $subdomain = "vnc-$(Get-Random -Min 1000 -Max 9999)"
+              $logFile = "$env:TEMP\lt_$attempt.log"
+              
+              $process = Start-Process powershell -ArgumentList "-Command","lt --port 6080 --subdomain $subdomain > $logFile 2>&1" -PassThru -WindowStyle Hidden
+              Start-Sleep -Seconds 10
+              
+              if (Test-Path $logFile) {
+                  $content = Get-Content $logFile -Raw
+                  if ($content -match "(https://.*\.loca\.lt)") {
+                      $tunnelUrl = $matches[1].Trim()
+                      Write-Host "SUCCESS: $tunnelUrl"
+                      echo "TUNNEL_URL=$tunnelUrl" >> $env:GITHUB_ENV
+                  } else {
+                      Write-Host "Failed to get URL, retrying..."
+                      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                  }
+              }
           }
 
       - name: Display Connection Information
         run: |
           Write-Host "`n╔════════════════════════════════════════════════════════════╗"
-          Write-Host "║ 🌐 BYPASS DETAILS:                                        ║"
+          Write-Host "║ 🌐 BYPASS DETAILS (FIXED 503):                            ║"
           Write-Host "║ 1. Open URL: $env:TUNNEL_URL                              ║"
-          Write-Host "║ 2. Use this IP to Bypass: $env:RUNNER_IP                  ║"
+          Write-Host "║ 2. Enter this IP if asked: $env:RUNNER_IP                 ║"
           Write-Host "║ 3. VNC Password: $env:VNC_PASSWORD                        ║"
           Write-Host "╚════════════════════════════════════════════════════════════╝`n"
 
       - name: Maintain Connection
         run: |
-          Write-Host "🟢 SESSION ACTIVE! Port 6080 is Tunneled."
+          Write-Host "🟢 SESSION ACTIVE!"
           while ($true) { Start-Sleep -Seconds 300 }
