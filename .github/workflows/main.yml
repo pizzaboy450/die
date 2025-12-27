@@ -1,20 +1,41 @@
-- name: Launch Cloudflare Tunnel
+name: VNC MuMu (Cloudflare Fix)
+on: workflow_dispatch
+
+jobs:
+  vnc-job:
+    runs-on: windows-latest
+    steps:
+      - name: Install VNC & Cloudflared
+        run: |
+          choco install tightvnc cloudflared -y
+          pip install websockify
+
+      - name: Start VNC Server
+        run: |
+          $pass = "VNCpass123!"
+          & "C:\Program Files\TightVNC\tvnserver.exe" -silent -controlservice -set AdminPasswordPlain="$pass"
+          Start-Service -Name "tvnserver"
+
+      - name: Start Web Bridge
+        run: |
+          # Converts VNC to a browser-friendly format on port 6080
+          Start-Process powershell -ArgumentList "-Command","python -m websockify 6080 localhost:5900" -WindowStyle Hidden
+
+      - name: Launch Cloudflare Tunnel
         shell: pwsh
         run: |
           Write-Host "Creating secure tunnel..."
-          # Start cloudflared and capture BOTH standard output and errors
-          Start-Process cloudflared -ArgumentList "tunnel --url http://127.0.0.1:6080" -RedirectStandardError "cloudflare.log" -NoNewWindow
+          # We redirect the Error stream (2) to the same place as Output (1)
+          Start-Process cloudflared -ArgumentList "tunnel --url http://127.0.0.1:6080" -RedirectStandardError "cloudflare.log"
           
           Write-Host "Waiting for Cloudflare to generate URL..."
           $url = $null
           $attempts = 0
           
-          # Loop for 30 seconds until the URL appears in the logs
-          while ($attempts -lt 15 -and -not $url) {
+          while ($attempts -lt 20 -and -not $url) {
               Start-Sleep -Seconds 2
               if (Test-Path "cloudflare.log") {
                   $content = Get-Content "cloudflare.log" -Raw
-                  # Search for the trycloudflare pattern
                   if ($content -match "https://[a-zA-Z0-9-]+\.trycloudflare\.com") {
                       $url = $matches[0]
                   }
@@ -30,9 +51,9 @@
               Write-Host "VNC PASSWORD: VNCpass123!"
               Write-Host "==========================================`n"
           } else {
-              Write-Error "Cloudflare failed to provide a URL. Check cloudflare.log below:"
+              Write-Error "Cloudflare failed to provide a URL."
               Get-Content "cloudflare.log"
           }
           
-          # Keep the VM alive
+          # Keep the VM alive for 6 hours
           while($true) { Start-Sleep 300 }
